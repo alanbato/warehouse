@@ -23,8 +23,8 @@ from warehouse.packaging.models import File, JournalEntry, Project, Release
 
 
 @view_config(
-    route_name="legacy.api.simple.index",
-    renderer="legacy/api/simple/index.html",
+    route_name="legacy.api.draft.index",
+    renderer="legacy/api/draft/index.html",
     decorator=[
         cache_control(10 * 60),  # 10 minutes
         origin_cache(
@@ -34,23 +34,28 @@ from warehouse.packaging.models import File, JournalEntry, Project, Release
         ),
     ],
 )
-def simple_index(request):
+def draft_index(request):
     # Get the latest serial number
     serial = request.db.query(func.max(JournalEntry.id)).scalar() or 0
     request.response.headers["X-PyPI-Last-Serial"] = str(serial)
 
+    draft_hash = request.matchdict.get("hash")
+
     # Fetch the name and normalized name for all of our projects
     projects = (
         request.db.query(Project.name, Project.normalized_name)
+        .join(Release)
+        .filter(Release.draft_hash == draft_hash)
+        .filter(Release.published.is_(None))
         .order_by(Project.normalized_name)
         .all()
     )
 
-    return {"projects": projects}
+    return {"projects": projects, "draft_hash": draft_hash}
 
 
 @view_config(
-    route_name="legacy.api.simple.detail",
+    route_name="legacy.api.draft.detail",
     context=Project,
     renderer="legacy/api/simple/detail.html",
     decorator=[
@@ -62,7 +67,7 @@ def simple_index(request):
         ),
     ],
 )
-def simple_detail(project, request):
+def draft_detail(project, request):
     # Make sure that we're using the normalized version of the URL.
     if project.normalized_name != request.matchdict.get(
         "name", project.normalized_name
@@ -70,6 +75,8 @@ def simple_detail(project, request):
         return HTTPMovedPermanently(
             request.current_route_path(name=project.normalized_name)
         )
+
+    draft_hash = request.matchdict.get("hash")
 
     # Get the latest serial number for this project.
     request.response.headers["X-PyPI-Last-Serial"] = str(project.last_serial)
@@ -79,7 +86,11 @@ def simple_detail(project, request):
         request.db.query(File)
         .options(joinedload(File.release))
         .join(Release)
-        .filter(Release.project == project, Release.published.isnot(None))
+        .filter(
+            Release.project == project,
+            Release.published.is_(None),
+            Release.draft_hash == draft_hash,
+        )
         .all(),
         key=lambda f: (parse(f.release.version), f.filename),
     )
