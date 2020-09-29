@@ -10,6 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from datetime import datetime, timezone
 import email
 import hashlib
 import hmac
@@ -1037,8 +1038,8 @@ def file_upload(request):
                 ),
             ) from None
 
+    canonical_version = packaging.utils.canonicalize_version(form.version.data)
     try:
-        canonical_version = packaging.utils.canonicalize_version(form.version.data)
         release = (
             request.db.query(Release)
             .filter(
@@ -1059,6 +1060,10 @@ def file_upload(request):
             .one()
         )
     except NoResultFound:
+
+        # Determine if this is a draft release or a published one
+        release_is_draft = bool(request.headers.get("Is-Draft", default=False))
+
         # Look up all of the valid classifiers
         all_classifiers = request.db.query(Classifier).all()
 
@@ -1126,7 +1131,7 @@ def file_upload(request):
             },
             uploader=request.user,
             uploaded_via=request.user_agent,
-            published=func.now(),
+            published=None if release_is_draft else datetime.now(tz=timezone.utc),
         )
         request.db.add(release)
         # TODO: This should be handled by some sort of database trigger or
