@@ -1534,7 +1534,7 @@ class ManageProjectRelease:
             self.request.route_path(
                 "manage.project.release",
                 project_name=self.release.project.name,
-                version=self.release.version,
+                version=self.release.version_or_draft,
             )
         )
 
