@@ -14,7 +14,6 @@ import enum
 
 from collections import OrderedDict
 from urllib.parse import urlparse
-import logging
 
 import packaging.utils
 
@@ -199,7 +198,8 @@ class Project(SitemapMixin, db.Model):
 
         try:
             query = session.query(Release).filter(
-                Release.project == self, Release.canonical_version == canonical_version,
+                Release.project == self,
+                Release.canonical_version == canonical_version,
             )
             if draft_hash:
                 query = query.filter(Release.draft_hash == draft_hash)

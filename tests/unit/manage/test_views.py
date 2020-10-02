@@ -2645,10 +2645,6 @@ class TestManageProjectRelease:
 
         assert release.published is not None
 
-        assert get_user_role_in_project.calls == [
-            pretend.call(release.project, request.user, request),
-        ]
-
         assert request.db.add.calls == [pretend.call(journal_obj)]
         assert journal_cls.calls == [
             pretend.call(
