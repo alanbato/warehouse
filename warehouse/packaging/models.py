@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 import packaging.utils
 
 from citext import CIText
-from pyramid.security import Allow
+from pyramid.authorization import Allow
 from pyramid.threadlocal import get_current_request
 from sqlalchemy import (
     BigInteger,
@@ -31,7 +31,6 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
-    String,
     Table,
     Text,
     UniqueConstraint,
@@ -39,16 +38,20 @@ from sqlalchemy import (
     orm,
     sql,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.associationproxy import association_proxy
-from sqlalchemy.ext.declarative import declared_attr
+from sqlalchemy.ext.declarative import declared_attr  # type: ignore
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import validates
 from sqlalchemy.orm.exc import MultipleResultsFound, NoResultFound
+from sqlalchemy.sql import expression
+from trove_classifiers import sorted_classifiers
 
 from warehouse import db
 from warehouse.accounts.models import User
 from warehouse.classifiers.models import Classifier
+from warehouse.events.models import HasEvents
+from warehouse.integrations.vulnerabilities.models import VulnerabilityRecord
 from warehouse.sitemap.models import SitemapMixin
 from warehouse.utils import dotted_navigator
 from warehouse.utils.attrs import make_repr
@@ -59,6 +62,7 @@ class Role(db.Model):
     __tablename__ = "roles"
     __table_args__ = (
         Index("roles_user_id_idx", "user_id"),
+        Index("roles_project_id_idx", "project_id"),
         UniqueConstraint("user_id", "project_id", name="_roles_user_project_uc"),
     )
 
@@ -101,15 +105,36 @@ class RoleInvitation(db.Model):
     )
     token = Column(Text, nullable=False)
     user_id = Column(
-        ForeignKey("users.id", onupdate="CASCADE", ondelete="CASCADE"), nullable=False
+        ForeignKey("users.id", onupdate="CASCADE", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     project_id = Column(
         ForeignKey("projects.id", onupdate="CASCADE", ondelete="CASCADE"),
         nullable=False,
+        index=True,
     )
 
     user = orm.relationship(User, lazy=False)
     project = orm.relationship("Project", lazy=False)
+
+
+class DraftFactory:
+    def __init__(self, request):
+        self.request = request
+
+    def __getitem__(self, draft_hash):
+        try:
+            release = (
+                self.request.db.query(Release)
+                .filter(Release.draft_hash == draft_hash, Release.published.is_(None))
+                .one()
+            )
+            return {
+                release.project.name: release,
+            }
+        except NoResultFound:
+            raise KeyError from None
 
 
 class ProjectFactory:
@@ -127,7 +152,18 @@ class ProjectFactory:
             raise KeyError from None
 
 
-class Project(SitemapMixin, db.Model):
+class TwoFactorRequireable:
+    # Project owner requires 2FA for this project
+    owners_require_2fa = Column(Boolean, nullable=False, server_default=sql.false())
+    # PyPI requires 2FA for this project
+    pypi_mandates_2fa = Column(Boolean, nullable=False, server_default=sql.false())
+
+    @hybrid_property
+    def two_factor_required(self):
+        return self.owners_require_2fa | self.pypi_mandates_2fa
+
+
+class Project(SitemapMixin, TwoFactorRequireable, HasEvents, db.Model):
 
     __tablename__ = "projects"
     __table_args__ = (
@@ -155,33 +191,35 @@ class Project(SitemapMixin, db.Model):
 
     total_size = Column(BigInteger, server_default=sql.text("0"))
 
-    users = orm.relationship(User, secondary=Role.__table__, backref="projects")
+    users = orm.relationship(User, secondary=Role.__table__, backref="projects")  # type: ignore # noqa
 
     releases = orm.relationship(
         "Release",
         backref="project",
         cascade="all, delete-orphan",
-        order_by=lambda: Release._pypi_ordering.desc(),
+        order_by=lambda: Release._pypi_ordering.desc(),  # type: ignore
         passive_deletes=True,
-    )
-
-    events = orm.relationship(
-        "ProjectEvent", backref="project", cascade="all, delete-orphan", lazy=True
     )
 
     def __getitem__(self, version):
         session = orm.object_session(self)
         canonical_version = packaging.utils.canonicalize_version(version)
+        try:
+            canonical_version, something, draft_hash = canonical_version.split("--")
+        except ValueError:
+            draft_hash = None
 
         try:
-            return (
-                session.query(Release)
-                .filter(
-                    Release.project == self,
-                    Release.canonical_version == canonical_version,
-                )
-                .one()
+            query = session.query(Release).filter(
+                Release.project == self,
+                Release.canonical_version == canonical_version,
             )
+            if draft_hash:
+                query = query.filter(Release.draft_hash == draft_hash)
+            else:
+                query = query.filter(Release.published.isnot(None))
+            return query.one()
+
         except MultipleResultsFound:
             # There are multiple releases of this project which have the same
             # canonical version that were uploaded before we checked for
@@ -216,20 +254,12 @@ class Project(SitemapMixin, db.Model):
             query.all(), key=lambda x: ["Owner", "Maintainer"].index(x.role_name)
         ):
             if role.role_name == "Owner":
-                acls.append((Allow, str(role.user.id), ["manage:project", "upload"]))
+                acls.append(
+                    (Allow, f"user:{role.user.id}", ["manage:project", "upload"])
+                )
             else:
-                acls.append((Allow, str(role.user.id), ["upload"]))
+                acls.append((Allow, f"user:{role.user.id}", ["upload"]))
         return acls
-
-    def record_event(self, *, tag, ip_address, additional=None):
-        session = orm.object_session(self)
-        event = ProjectEvent(
-            project=self, tag=tag, ip_address=ip_address, additional=additional
-        )
-        session.add(event)
-        session.flush()
-
-        return event
 
     @property
     def documentation_url(self):
@@ -250,7 +280,7 @@ class Project(SitemapMixin, db.Model):
             .query(
                 Release.version, Release.created, Release.is_prerelease, Release.yanked
             )
-            .filter(Release.project == self)
+            .filter(Release.project == self, Release.published.isnot(None))
             .order_by(Release._pypi_ordering.desc())
             .all()
         )
@@ -260,24 +290,14 @@ class Project(SitemapMixin, db.Model):
         return (
             orm.object_session(self)
             .query(Release.version, Release.created, Release.is_prerelease)
-            .filter(Release.project == self, Release.yanked.is_(False))
+            .filter(
+                Release.project == self,
+                Release.yanked.is_(False),
+                Release.published.isnot(None),
+            )
             .order_by(Release.is_prerelease.nullslast(), Release._pypi_ordering.desc())
             .first()
         )
-
-
-class ProjectEvent(db.Model):
-    __tablename__ = "project_events"
-
-    project_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("projects.id", deferrable=True, initially="DEFERRED"),
-        nullable=False,
-    )
-    tag = Column(String, nullable=False)
-    time = Column(DateTime, nullable=False, server_default=sql.func.now())
-    ip_address = Column(String, nullable=False)
-    additional = Column(JSONB, nullable=True)
 
 
 class DependencyKind(enum.IntEnum):
@@ -352,9 +372,11 @@ class Release(db.Model):
         ForeignKey("projects.id", onupdate="CASCADE", ondelete="CASCADE"),
         nullable=False,
     )
+    project_name = Column(Text)
     version = Column(Text, nullable=False)
     canonical_version = Column(Text, nullable=False)
     is_prerelease = orm.column_property(func.pep440_is_prerelease(version))
+    draft_hash = orm.column_property(func.make_draft_hash(project_name, version))
     author = Column(Text)
     author_email = Column(Text)
     maintainer = Column(Text)
@@ -370,10 +392,12 @@ class Release(db.Model):
     created = Column(
         DateTime(timezone=False), nullable=False, server_default=sql.func.now()
     )
+    published = Column(DateTime(timezone=False), nullable=True)
 
     description_id = Column(
         ForeignKey("release_descriptions.id", onupdate="CASCADE", ondelete="CASCADE"),
         nullable=False,
+        index=True,
     )
     description = orm.relationship(
         "Description",
@@ -394,8 +418,11 @@ class Release(db.Model):
     _classifiers = orm.relationship(
         Classifier,
         backref="project_releases",
-        secondary=lambda: release_classifiers,
-        order_by=Classifier.classifier,
+        secondary=lambda: release_classifiers,  # type: ignore
+        order_by=expression.case(
+            {c: i for i, c in enumerate(sorted_classifiers)},
+            value=Classifier.classifier,
+        ),
         passive_deletes=True,
     )
     classifiers = association_proxy("_classifiers", "classifier")
@@ -405,7 +432,7 @@ class Release(db.Model):
         backref="release",
         cascade="all, delete-orphan",
         lazy="dynamic",
-        order_by=lambda: File.filename,
+        order_by=lambda: File.filename,  # type: ignore
         passive_deletes=True,
     )
 
@@ -413,6 +440,13 @@ class Release(db.Model):
         "Dependency",
         backref="release",
         cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    vulnerabilities = orm.relationship(
+        VulnerabilityRecord,
+        back_populates="releases",
+        secondary="release_vulnerabilities",
         passive_deletes=True,
     )
 
@@ -461,6 +495,16 @@ class Release(db.Model):
             name, _, url = urlspec.partition(",")
             name = name.strip()
             url = url.strip()
+
+            # avoid duplicating homepage/download links in case the same
+            # url is specified in the pkginfo twice (in the Home-page
+            # or Download-URL field and again in the Project-URL fields)
+            comp_name = name.casefold().replace("-", "").replace("_", "")
+            if comp_name == "homepage" and url == _urls.get("Homepage"):
+                continue
+            if comp_name == "downloadurl" and url == _urls.get("Download"):
+                continue
+
             if name and url:
                 _urls[name] = url
 
@@ -487,6 +531,18 @@ class Release(db.Model):
                 self.maintainer_email,
                 self.requires_python,
             ]
+        )
+
+    @property
+    def is_draft(self):
+        return self.published is None
+
+    @property
+    def version_or_draft(self):
+        return (
+            f"{self.version}--draft--{self.draft_hash}"
+            if self.is_draft
+            else self.version
         )
 
 
@@ -550,7 +606,7 @@ class File(db.Model):
     def pgp_path(self):
         return self.path + ".asc"
 
-    @pgp_path.expression
+    @pgp_path.expression  # type: ignore
     def pgp_path(self):
         return func.concat(self.path, ".asc")
 

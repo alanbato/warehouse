@@ -31,8 +31,10 @@ KNOWN_LOCALES = {
         "el",  # Greek
         "de",  # German
         "zh_Hans",  # Simplified Chinese
+        "zh_Hant",  # Traditional Chinese
         "ru",  # Russian
         "he",  # Hebrew
+        "eo",  # Esperanto
     ]
 }
 
@@ -168,7 +170,7 @@ def translated_view(view, info):
         return wrapped
 
 
-translated_view.options = {"has_translations"}
+translated_view.options = {"has_translations"}  # type: ignore
 
 
 def includeme(config):

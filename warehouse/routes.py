@@ -46,18 +46,12 @@ def includeme(config):
         "pages/security.html",
         view_kw={"has_translations": True},
     )
-    config.add_template_view(
-        "sponsor",
-        "/sponsor/",
-        "pages/sponsor.html",
-        view_kw={"has_translations": True},
-    )
+    # Redirect the old "sponsor PyPI" page to the sponsors page
+    config.add_redirect("/sponsor/", "/sponsors/", domain=warehouse)
     config.add_template_view(
         "sponsors",
         "/sponsors/",
-        # Use the full resource path here to make it able to be overridden by
-        # pypi-theme.
-        "warehouse:templates/pages/sponsors.html",
+        "pages/sponsors.html",
         view_kw={"has_translations": True},
     )
 
@@ -106,6 +100,18 @@ def includeme(config):
         traverse="/{username}",
         domain=warehouse,
     )
+    config.add_route(
+        "includes.sidebar-sponsor-logo",
+        "/_includes/sidebar-sponsor-logo/",
+        domain=warehouse,
+    )
+    config.add_route(
+        "includes.administer-project-include",
+        "/_includes/administer-project-include/{project_name}",
+        factory="warehouse.packaging.models:ProjectFactory",
+        traverse="/{project_name}",
+        domain=warehouse,
+    )
 
     # Classifier Routes
     config.add_route("classifiers", "/classifiers/", domain=warehouse)
@@ -120,6 +126,7 @@ def includeme(config):
     )
 
     # Accounts
+    config.add_redirect("/u/{username}/", "/user/{username}/", domain=warehouse)
     config.add_route(
         "accounts.profile",
         "/user/{username}/",
@@ -163,9 +170,11 @@ def includeme(config):
         "/account/verify-project-role/",
         domain=warehouse,
     )
-
     # Management (views for logged-in users)
     config.add_route("manage.account", "/manage/account/", domain=warehouse)
+    config.add_route(
+        "manage.account.two-factor", "/manage/account/two-factor/", domain=warehouse
+    )
     config.add_route(
         "manage.account.totp-provision",
         "/manage/account/totp-provision",
@@ -206,11 +215,24 @@ def includeme(config):
         "/manage/account/recovery-codes/regenerate",
         domain=warehouse,
     )
+    config.add_route(
+        "manage.account.recovery-codes.burn",
+        "/manage/account/recovery-codes/burn",
+        domain=warehouse,
+    )
     config.add_route("manage.account.token", "/manage/account/token/", domain=warehouse)
+    config.add_route("manage.organizations", "/manage/organizations/", domain=warehouse)
     config.add_route("manage.projects", "/manage/projects/", domain=warehouse)
     config.add_route(
         "manage.project.settings",
         "/manage/project/{project_name}/settings/",
+        factory="warehouse.packaging.models:ProjectFactory",
+        traverse="/{project_name}",
+        domain=warehouse,
+    )
+    config.add_route(
+        "manage.project.settings.publishing",
+        "/manage/project/{project_name}/settings/publishing/",
         factory="warehouse.packaging.models:ProjectFactory",
         traverse="/{project_name}",
         domain=warehouse,
@@ -325,6 +347,19 @@ def includeme(config):
         read_only=True,
         domain=warehouse,
     )
+    # Integration URLs
+
+    config.add_route(
+        "integrations.github.disclose-token",
+        "/_/github/disclose-token",
+        domain=warehouse,
+    )
+
+    config.add_route(
+        "integrations.vulnerabilities.osv.report",
+        "/_/vulnerabilities/osv/report",
+        domain=warehouse,
+    )
 
     # Legacy URLs
     config.add_route("legacy.api.simple.index", "/simple/", domain=warehouse)
@@ -333,6 +368,23 @@ def includeme(config):
         "/simple/{name}/",
         factory="warehouse.packaging.models:ProjectFactory",
         traverse="/{name}/",
+        read_only=True,
+        domain=warehouse,
+    )
+
+    config.add_route(
+        "legacy.api.draft.index",
+        "/draft/{hash}/",
+        factory="warehouse.packaging.models:DraftFactory",
+        traverse="/{hash}/",
+        read_only=True,
+        domain=warehouse,
+    )
+    config.add_route(
+        "legacy.api.draft.detail",
+        "/draft/{hash}/{name}/",
+        factory="warehouse.packaging.models:DraftFactory",
+        traverse="/{hash}/{name}/",
         read_only=True,
         domain=warehouse,
     )
@@ -373,7 +425,7 @@ def includeme(config):
 
     # Legacy Action URLs
     # TODO: We should probably add Warehouse routes for these that just error
-    #       and direct people to use upload.pypi.io
+    #       and direct people to use upload.pypi.org
     config.add_pypi_action_route(
         "legacy.api.pypi.file_upload", "file_upload", domain=warehouse
     )

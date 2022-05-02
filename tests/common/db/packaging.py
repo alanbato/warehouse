@@ -12,10 +12,9 @@
 
 import datetime
 import hashlib
-import uuid
 
 import factory
-import factory.fuzzy
+import faker
 import packaging.utils
 
 from warehouse.packaging.models import (
@@ -26,7 +25,6 @@ from warehouse.packaging.models import (
     JournalEntry,
     ProhibitedProjectName,
     Project,
-    ProjectEvent,
     Release,
     Role,
     RoleInvitation,
@@ -36,28 +34,30 @@ from warehouse.utils import readme
 from .accounts import UserFactory
 from .base import WarehouseFactory
 
+fake = faker.Faker()
+
 
 class ProjectFactory(WarehouseFactory):
     class Meta:
         model = Project
 
-    id = factory.LazyFunction(uuid.uuid4)
-    name = factory.fuzzy.FuzzyText(length=12)
+    id = factory.Faker("uuid4", cast_to=None)
+    name = factory.Faker("pystr", max_chars=12)
 
 
 class ProjectEventFactory(WarehouseFactory):
     class Meta:
-        model = ProjectEvent
+        model = Project.Event
 
-    project = factory.SubFactory(ProjectFactory)
+    source = factory.SubFactory(ProjectFactory)
 
 
 class DescriptionFactory(WarehouseFactory):
     class Meta:
         model = Description
 
-    id = factory.LazyFunction(uuid.uuid4)
-    raw = factory.fuzzy.FuzzyText(length=100)
+    id = factory.Faker("uuid4", cast_to=None)
+    raw = factory.Faker("paragraph")
     html = factory.LazyAttribute(lambda o: readme.render(o.raw))
     rendered_by = factory.LazyAttribute(lambda o: readme.renderer_version())
 
@@ -66,7 +66,7 @@ class ReleaseFactory(WarehouseFactory):
     class Meta:
         model = Release
 
-    id = factory.LazyFunction(uuid.uuid4)
+    id = factory.Faker("uuid4", cast_to=None)
     project = factory.SubFactory(ProjectFactory)
     version = factory.Sequence(lambda n: str(n) + ".0")
     canonical_version = factory.LazyAttribute(
@@ -76,6 +76,9 @@ class ReleaseFactory(WarehouseFactory):
 
     uploader = factory.SubFactory(UserFactory)
     description = factory.SubFactory(DescriptionFactory)
+    published = factory.Faker(
+        "date_time_between_dates", datetime_start=datetime.datetime(2008, 1, 1)
+    )
 
 
 class FileFactory(WarehouseFactory):
@@ -84,7 +87,8 @@ class FileFactory(WarehouseFactory):
 
     release = factory.SubFactory(ReleaseFactory)
     python_version = "source"
-    filename = factory.fuzzy.FuzzyText(length=12)
+    # TODO: Replace when factory_boy supports `unique`. See https://git.io/JM6kx
+    filename = factory.Sequence(lambda _: fake.unique.file_name())
     md5_digest = factory.LazyAttribute(
         lambda o: hashlib.md5(o.filename.encode("utf8")).hexdigest()
     )
@@ -94,7 +98,9 @@ class FileFactory(WarehouseFactory):
     blake2_256_digest = factory.LazyAttribute(
         lambda o: hashlib.blake2b(o.filename.encode("utf8"), digest_size=32).hexdigest()
     )
-    upload_time = factory.fuzzy.FuzzyNaiveDateTime(datetime.datetime(2008, 1, 1))
+    upload_time = factory.Faker(
+        "date_time_between_dates", datetime_start=datetime.datetime(2008, 1, 1)
+    )
     path = factory.LazyAttribute(
         lambda o: "/".join(
             [
@@ -131,8 +137,10 @@ class DependencyFactory(WarehouseFactory):
         model = Dependency
 
     release = factory.SubFactory(ReleaseFactory)
-    kind = factory.fuzzy.FuzzyChoice(int(kind) for kind in DependencyKind)
-    specifier = factory.fuzzy.FuzzyText(length=12)
+    kind = factory.Faker(
+        "random_element", elements=[int(kind) for kind in DependencyKind]
+    )
+    specifier = factory.Faker("word")
 
 
 class JournalEntryFactory(WarehouseFactory):
@@ -140,9 +148,11 @@ class JournalEntryFactory(WarehouseFactory):
         model = JournalEntry
 
     id = factory.Sequence(lambda n: n)
-    name = factory.fuzzy.FuzzyText(length=12)
+    name = factory.Faker("word")
     version = factory.Sequence(lambda n: str(n) + ".0")
-    submitted_date = factory.fuzzy.FuzzyNaiveDateTime(datetime.datetime(2008, 1, 1))
+    submitted_date = factory.Faker(
+        "date_time_between_dates", datetime_start=datetime.datetime(2008, 1, 1)
+    )
     submitted_by = factory.SubFactory(UserFactory)
 
 
@@ -150,6 +160,8 @@ class ProhibitedProjectFactory(WarehouseFactory):
     class Meta:
         model = ProhibitedProjectName
 
-    created = factory.fuzzy.FuzzyNaiveDateTime(datetime.datetime(2008, 1, 1))
-    name = factory.fuzzy.FuzzyText(length=12)
+    created = factory.Faker(
+        "date_time_between_dates", datetime_start=datetime.datetime(2008, 1, 1)
+    )
+    name = factory.Faker("pystr", max_chars=12)
     prohibited_by = factory.SubFactory(UserFactory)

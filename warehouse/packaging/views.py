@@ -10,13 +10,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from natsort import natsorted
 from pyramid.httpexceptions import HTTPMovedPermanently, HTTPNotFound
 from pyramid.view import view_config
 from sqlalchemy.orm.exc import NoResultFound
 
 from warehouse.accounts.models import User
 from warehouse.cache.origin import origin_cache
-from warehouse.packaging.models import Project, Release, Role
+from warehouse.packaging.models import File, Project, Release, Role
 from warehouse.utils import readme
 
 
@@ -38,7 +39,7 @@ def project_detail(project, request):
     try:
         release = (
             request.db.query(Release)
-            .filter(Release.project == project)
+            .filter(Release.project == project, Release.published.isnot(None))
             .order_by(
                 Release.yanked,
                 Release.is_prerelease.nullslast(),
@@ -73,7 +74,12 @@ def release_detail(release, request):
     #
     # This also handles the case where both the version and the project name
     # need adjusted, and handles it in a single redirect.
-    if release.version != request.matchdict.get("version", release.version):
+    #
+    # Only redirect if it is not a draft release.
+    if (
+        release.version != request.matchdict.get("version", release.version)
+        and not release.is_draft
+    ):
         return HTTPMovedPermanently(
             request.current_route_path(name=project.name, version=release.version)
         )
@@ -121,11 +127,25 @@ def release_detail(release, request):
     else:
         license = license_classifiers or short_license or None
 
+    # We cannot easily sort naturally in SQL, sort here and pass to template
+    sdists = natsorted(
+        release.files.filter(File.packagetype == "sdist").all(),
+        reverse=True,
+        key=lambda f: f.filename,
+    )
+    bdists = natsorted(
+        release.files.filter(File.packagetype != "sdist").all(),
+        reverse=True,
+        key=lambda f: f.filename,
+    )
+
     return {
         "project": project,
         "release": release,
         "description": description,
-        "files": release.files.all(),
+        "files": sdists + bdists,
+        "sdists": sdists,
+        "bdists": bdists,
         "latest_version": project.latest_version,
         "all_versions": project.all_versions,
         "maintainers": maintainers,

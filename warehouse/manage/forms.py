@@ -25,6 +25,9 @@ from warehouse.accounts.forms import (
     TOTPValueMixin,
     WebAuthnCredentialMixin,
 )
+from warehouse.i18n import localize as _
+
+# /manage/account/ forms
 
 
 class RoleNameMixin:
@@ -65,7 +68,17 @@ class SaveAccountForm(forms.Form):
 
     __params__ = ["name", "public_email"]
 
-    name = wtforms.StringField()
+    name = wtforms.StringField(
+        validators=[
+            wtforms.validators.Length(
+                max=100,
+                message=_(
+                    "The name is too long. "
+                    "Choose a name with 100 characters or less."
+                ),
+            )
+        ]
+    )
     public_email = wtforms.SelectField(choices=[("", "Not displayed")])
 
     def __init__(self, *args, user_service, user_id, **kwargs):
@@ -184,7 +197,7 @@ class ProvisionWebAuthnForm(WebAuthnCredentialMixin, forms.Form):
 
     def validate_credential(self, field):
         try:
-            credential_dict = json.loads(field.data.encode("utf8"))
+            json.loads(field.data.encode("utf-8"))
         except json.JSONDecodeError:
             raise wtforms.validators.ValidationError(
                 "Invalid WebAuthn credential: Bad payload"
@@ -192,12 +205,12 @@ class ProvisionWebAuthnForm(WebAuthnCredentialMixin, forms.Form):
 
         try:
             validated_credential = self.user_service.verify_webauthn_credential(
-                credential_dict,
+                field.data.encode("utf-8"),
                 challenge=self.challenge,
                 rp_id=self.rp_id,
                 origin=self.origin,
             )
-        except webauthn.RegistrationRejectedException as e:
+        except webauthn.RegistrationRejectedError as e:
             raise wtforms.validators.ValidationError(str(e))
 
         self.validated_credential = validated_credential
@@ -286,3 +299,106 @@ class DeleteMacaroonForm(UsernameMixin, PasswordMixin, forms.Form):
         macaroon_id = field.data
         if self.macaroon_service.find_macaroon(macaroon_id) is None:
             raise wtforms.validators.ValidationError("No such macaroon")
+
+
+class Toggle2FARequirementForm(forms.Form):
+    __params__ = ["two_factor_requirement_sentinel"]
+
+    two_factor_requirement_sentinel = wtforms.HiddenField()
+
+
+# /manage/organizations/ forms
+
+
+class NewOrganizationNameMixin:
+
+    name = wtforms.StringField(
+        validators=[
+            wtforms.validators.DataRequired(
+                message="Specify organization account name"
+            ),
+            wtforms.validators.Length(
+                max=50,
+                message=_(
+                    "Choose an organization account name with 50 characters or less."
+                ),
+            ),
+            # the regexp below must match the CheckConstraint
+            # for the name field in organizations.model.Organization
+            wtforms.validators.Regexp(
+                r"^[a-zA-Z0-9][a-zA-Z0-9._-]*[a-zA-Z0-9]$",
+                message=_(
+                    "The organization account name is invalid. "
+                    "Organization account names "
+                    "must be composed of letters, numbers, "
+                    "dots, hyphens and underscores. And must "
+                    "also start and finish with a letter or number. "
+                    "Choose a different organization account name."
+                ),
+            ),
+        ]
+    )
+
+    def validate_name(self, field):
+        if self.organization_service.find_organizationid(field.data) is not None:
+            raise wtforms.validators.ValidationError(
+                _(
+                    "This organization account name is already being "
+                    "used by another account. Choose a different "
+                    "organization account name."
+                )
+            )
+
+
+class CreateOrganizationForm(forms.Form, NewOrganizationNameMixin):
+
+    __params__ = ["name", "display_name", "link_url", "description", "orgtype"]
+
+    def __init__(self, *args, organization_service, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.organization_service = organization_service
+
+    display_name = wtforms.StringField(
+        validators=[
+            wtforms.validators.DataRequired(message="Specify your organization name"),
+            wtforms.validators.Length(
+                max=100,
+                message=_(
+                    "The organization name is too long. "
+                    "Choose a organization name with 100 characters or less."
+                ),
+            ),
+        ]
+    )
+    link_url = wtforms.URLField(
+        validators=[
+            wtforms.validators.DataRequired(message="Specify your organization URL"),
+            wtforms.validators.Length(
+                max=400,
+                message=_(
+                    "The organization URL is too long. "
+                    "Choose a organization URL with 400 characters or less."
+                ),
+            ),
+        ]
+    )
+    description = wtforms.TextAreaField(
+        validators=[
+            wtforms.validators.DataRequired(
+                message="Specify your organization description"
+            ),
+            wtforms.validators.Length(
+                max=400,
+                message=_(
+                    "The organization description is too long. "
+                    "Choose a organization description with 400 characters or less."
+                ),
+            ),
+        ]
+    )
+    orgtype = wtforms.SelectField(
+        choices=[("Company", "Company"), ("Community", "Community")],
+        validators=[
+            wtforms.validators.DataRequired(message="Select organization type"),
+        ],
+    )

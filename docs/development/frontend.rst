@@ -14,7 +14,7 @@ Building
 
 Static files should be automatically built when ``make serve`` is running;
 however, you can trigger a manual build of them by installing
-`NodeJS 10.x <https://nodejs.org/en/download/releases/>`_, installing
+`NodeJS 14.x <https://nodejs.org/en/download/releases/>`_, installing
 the dependencies using ``npm install`` and then running ``gulp dist``.
 
 If you're in a POSIX environment you may find
@@ -26,10 +26,9 @@ Tests
 -----
 
 The JavaScript codebase includes tests that can be ran via
-``make static_tests`` which is also ran with the ``make tests`` target.
-Both targets will run the tests in the Docker environment but they
-may also be ran locally using ``npm run test`` once NodeJS and the
-dependencies are installed as described above.
+``make static_tests``. This target will run the static tests in the Docker
+environment but they may also be ran locally using ``npm run test`` once NodeJS
+and the dependencies are installed as described above.
 
 JavaScript tests use the `Jest testing framework <https://jestjs.io/>`_
 along with `jest-dom <https://github.com/testing-library/jest-dom>`_
@@ -78,17 +77,11 @@ of some pages, but the "new" version of others.
 Browser Support
 ---------------
 
-========= ====================
- Browser  Supported Versions
-========= ====================
- Chrome   Current, Current - 1
- Firefox  Current, Current - 1
- Edge     Current, Current - 1
- Opera    Current, Current - 1
- Safari   9.0+
- IE       11+
-========= ====================
+We aim to support all major browsers, including IE11. We also support one-back,
+and follow the ``defaults`` recommendation from ``browserslist``.
 
+You can see the full list of supported browsers by running ``npx browserslist``
+in the root of the project.
 
 HTML Code Style
 ---------------

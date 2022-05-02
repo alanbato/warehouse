@@ -79,7 +79,7 @@ _illegal_xml_chars_re = re.compile("[%s]" % "".join(_illegal_ranges))
 
 
 def _clean_for_xml(data):
-    """ Sanitize any user-submitted data to ensure that it can be used in XML """
+    """Sanitize any user-submitted data to ensure that it can be used in XML"""
 
     # If data is None or an empty string, don't bother
     if data:
@@ -126,7 +126,7 @@ def ratelimit():
                 )
                 _resets_in = ratelimiter.resets_in(request.remote_addr)
                 if _resets_in is not None:
-                    _resets_in = int(_resets_in.total_seconds())
+                    _resets_in = max(1, int(_resets_in.total_seconds()))
                     message += f" Limit may reset in {_resets_in} seconds."
                 raise XMLRPCWrappedError(HTTPTooManyRequests(message))
             metrics.increment("warehouse.xmlrpc.ratelimiter.hit", tags=[])
@@ -195,7 +195,7 @@ class XMLRPCInvalidParamTypes(XmlRpcInvalidMethodParams):
         return f"client error; {self.exc}"
 
 
-class XMLRPCWrappedError(xmlrpc.server.Fault):
+class XMLRPCWrappedError(xmlrpc.client.Fault):
     def __init__(self, exc):
         # NOQA due to N815 'mixedCase variable in class scope',
         # This is the interface for specifying fault code and string for XmlRpcError
@@ -227,12 +227,29 @@ def exception_view(exc, request):
 
 @xmlrpc_method(method="search")
 def search(request, spec: Mapping[str, Union[str, List[str]]], operator: str = "and"):
+    metrics = request.find_service(IMetricsService, context=None)
+
+    # This uses a setting instead of an admin flag to avoid hitting the DB/Elasticsearch
+    # at all since the broad purpose of this flag is to enable us to control the load to
+    # our backend servers. This does mean that turning search on or off requires a
+    # deploy, but it should be infrequent enough to not matter.
+    if not request.registry.settings.get("warehouse.xmlrpc.search.enabled", True):
+        metrics.increment("warehouse.xmlrpc.search.deprecated")
+        raise XMLRPCWrappedError(
+            RuntimeError(
+                (
+                    "PyPI's XMLRPC API is currently disabled due to "
+                    "unmanageable load and will be deprecated in the near "
+                    "future. See https://status.python.org/ for more "
+                    "information."
+                )
+            )
+        )
+
     if operator not in {"and", "or"}:
         raise XMLRPCWrappedError(
             ValueError("Invalid operator, must be one of 'and' or 'or'.")
         )
-
-    metrics = request.find_service(IMetricsService, context=None)
 
     # Remove any invalid spec fields
     spec = {
@@ -263,7 +280,7 @@ def search(request, spec: Mapping[str, Union[str, List[str]]], operator: str = "
         for item in value:
             kw = {"query": item}
             if field in SEARCH_BOOSTS:
-                kw["boost"] = SEARCH_BOOSTS[field]
+                kw["boost"] = SEARCH_BOOSTS[field]  # type: ignore
             if q is None:
                 q = Q("match", **{field: kw})
             else:
@@ -530,10 +547,10 @@ def changelog_since_serial(request, serial: int):
 
 @xmlrpc_method(method="changelog")
 def changelog(request, since: int, with_ids: bool = False):
-    since = datetime.datetime.utcfromtimestamp(since)
+    since_dt = datetime.datetime.utcfromtimestamp(since)
     entries = (
         request.db.query(JournalEntry)
-        .filter(JournalEntry.submitted_date > since)
+        .filter(JournalEntry.submitted_date > since_dt)
         .order_by(JournalEntry.id)
         .limit(50000)
     )

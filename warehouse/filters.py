@@ -12,6 +12,7 @@
 
 import binascii
 import collections
+import datetime
 import enum
 import hmac
 import json
@@ -63,7 +64,7 @@ def _camo_url(request, url):
     return urllib.parse.urljoin(camo_url, path)
 
 
-@jinja2.contextfilter
+@jinja2.pass_context
 def camoify(ctx, value):
     request = ctx.get("request") or get_current_request()
 
@@ -124,22 +125,15 @@ def format_tags(tags):
 
 
 def format_classifiers(classifiers):
-    structured = collections.defaultdict(list)
+    structured = collections.OrderedDict()
 
     # Split up our classifiers into our data structure
     for classifier in classifiers:
         key, *value = classifier.split(" :: ", 1)
         if value:
+            if key not in structured:
+                structured[key] = []
             structured[key].append(value[0])
-
-    # Go through and ensure that all of the lists in our classifiers are in
-    # sorted order.
-    structured = {k: sorted(v) for k, v in structured.items()}
-
-    # Now, we'll ensure that our keys themselves are in sorted order, using an
-    # OrderedDict to preserve this ordering when we pass this data back up to
-    # our caller.
-    structured = collections.OrderedDict(sorted(structured.items()))
 
     return structured
 
@@ -161,6 +155,10 @@ def parse_version(version_str):
 
 def localize_datetime(timestamp):
     return pytz.utc.localize(timestamp)
+
+
+def is_recent(timestamp):
+    return timestamp + datetime.timedelta(days=30) > datetime.datetime.now()
 
 
 def includeme(config):

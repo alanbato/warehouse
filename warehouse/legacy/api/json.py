@@ -65,8 +65,12 @@ def json_project(project, request):
     try:
         release = (
             request.db.query(Release)
-            .filter(Release.project == project, Release.yanked.is_(False))
-            .order_by(Release.is_prerelease.nullslast(), Release._pypi_ordering.desc())
+            .filter(Release.project == project)
+            .order_by(
+                Release.yanked.asc(),
+                Release.is_prerelease.nullslast(),
+                Release._pypi_ordering.desc(),
+            )
             .limit(1)
             .one()
         )
@@ -159,6 +163,19 @@ def json_release(release, request):
         for r, fs in releases.items()
     }
 
+    # Serialize a list of vulnerabilties for this release
+    vulnerabilities = [
+        {
+            "id": vulnerability_record.id,
+            "source": vulnerability_record.source,
+            "link": vulnerability_record.link,
+            "aliases": vulnerability_record.aliases,
+            "details": vulnerability_record.details,
+            "fixed_in": vulnerability_record.fixed_in,
+        }
+        for vulnerability_record in release.vulnerabilities
+    ]
+
     return {
         "info": {
             "name": project.name,
@@ -194,6 +211,7 @@ def json_release(release, request):
         },
         "urls": releases[release.version],
         "releases": releases,
+        "vulnerabilities": vulnerabilities,
         "last_serial": project.last_serial,
     }
 

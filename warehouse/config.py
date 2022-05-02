@@ -10,6 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import distutils.util
 import enum
 import os
 import shlex
@@ -17,15 +18,15 @@ import shlex
 import transaction
 
 from pyramid import renderers
+from pyramid.authorization import Allow, Authenticated
 from pyramid.config import Configurator as _Configurator
 from pyramid.response import Response
-from pyramid.security import Allow, Authenticated
 from pyramid.tweens import EXCVIEW
 from pyramid_rpc.xmlrpc import XMLRPCRenderer
 
-from warehouse.errors import BasicAuthBreachedPassword
+from warehouse.errors import BasicAuthBreachedPassword, BasicAuthFailedPassword
 from warehouse.utils.static import ManifestCacheBuster
-from warehouse.utils.wsgi import HostRewrite, ProxyFixer, VhmRootRemover
+from warehouse.utils.wsgi import ProxyFixer, VhmRootRemover
 
 
 class Environment(enum.Enum):
@@ -58,6 +59,8 @@ class RootFactory:
     __acl__ = [
         (Allow, "group:admins", "admin"),
         (Allow, "group:moderators", "moderator"),
+        (Allow, "group:psf_staff", "psf_staff"),
+        (Allow, "group:with_admin_dashboard_access", "admin_dashboard_access"),
         (Allow, Authenticated, "manage:user"),
     ]
 
@@ -93,11 +96,14 @@ def activate_hook(request):
 def commit_veto(request, response):
     # By default pyramid_tm will veto the commit anytime request.exc_info is not None,
     # we are going to copy that logic with one difference, we are still going to commit
-    # if the exception was for a BreachedPassword.
+    # if the exception was for a BasicAuthFailedPassword or BreachedPassword.
     # TODO: We should probably use a registry or something instead of hardcoded.
-    exc_info = getattr(request, "exc_info", None)
-    if exc_info is not None and not isinstance(exc_info[1], BasicAuthBreachedPassword):
-        return True
+    allowed_types = (BasicAuthBreachedPassword, BasicAuthFailedPassword)
+
+    try:
+        return not isinstance(request.exc_info[1], allowed_types)
+    except (AttributeError, TypeError):
+        return False
 
 
 def template_view(config, name, route, template, route_kw=None, view_kw=None):
@@ -149,7 +155,6 @@ def configure(settings=None):
     # Pull in default configuration from the environment.
     maybe_set(settings, "warehouse.token", "WAREHOUSE_TOKEN")
     maybe_set(settings, "warehouse.num_proxies", "WAREHOUSE_NUM_PROXIES", int)
-    maybe_set(settings, "warehouse.theme", "WAREHOUSE_THEME")
     maybe_set(settings, "warehouse.domain", "WAREHOUSE_DOMAIN")
     maybe_set(settings, "forklift.domain", "FORKLIFT_DOMAIN")
     maybe_set(settings, "warehouse.legacy_domain", "WAREHOUSE_LEGACY_DOMAIN")
@@ -162,15 +167,22 @@ def configure(settings=None):
     maybe_set(
         settings, "warehouse.release_files_table", "WAREHOUSE_RELEASE_FILES_TABLE"
     )
+    maybe_set(settings, "github.token", "GITHUB_TOKEN")
+    maybe_set(
+        settings,
+        "github.token_scanning_meta_api.url",
+        "GITHUB_TOKEN_SCANNING_META_API_URL",
+        default="https://api.github.com/meta/public_keys/token_scanning",
+    )
     maybe_set(settings, "warehouse.trending_table", "WAREHOUSE_TRENDING_TABLE")
     maybe_set(settings, "celery.broker_url", "BROKER_URL")
     maybe_set(settings, "celery.result_url", "REDIS_URL")
     maybe_set(settings, "celery.scheduler_url", "REDIS_URL")
+    maybe_set(settings, "oidc.jwk_cache_url", "REDIS_URL")
     maybe_set(settings, "database.url", "DATABASE_URL")
     maybe_set(settings, "elasticsearch.url", "ELASTICSEARCH_URL")
     maybe_set(settings, "elasticsearch.url", "ELASTICSEARCH_SIX_URL")
     maybe_set(settings, "sentry.dsn", "SENTRY_DSN")
-    maybe_set(settings, "sentry.frontend_dsn", "SENTRY_FRONTEND_DSN")
     maybe_set(settings, "sentry.transport", "SENTRY_TRANSPORT")
     maybe_set(settings, "sessions.url", "REDIS_URL")
     maybe_set(settings, "ratelimit.url", "REDIS_URL")
@@ -183,6 +195,13 @@ def configure(settings=None):
     maybe_set(settings, "token.password.secret", "TOKEN_PASSWORD_SECRET")
     maybe_set(settings, "token.email.secret", "TOKEN_EMAIL_SECRET")
     maybe_set(settings, "token.two_factor.secret", "TOKEN_TWO_FACTOR_SECRET")
+    maybe_set(
+        settings,
+        "warehouse.xmlrpc.search.enabled",
+        "WAREHOUSE_XMLRPC_SEARCH",
+        coercer=distutils.util.strtobool,
+        default=True,
+    )
     maybe_set(settings, "warehouse.xmlrpc.cache.url", "REDIS_URL")
     maybe_set(
         settings,
@@ -207,12 +226,94 @@ def configure(settings=None):
         default=21600,  # 6 hours
     )
     maybe_set_compound(settings, "files", "backend", "FILES_BACKEND")
+    maybe_set_compound(settings, "simple", "backend", "SIMPLE_BACKEND")
     maybe_set_compound(settings, "docs", "backend", "DOCS_BACKEND")
+    maybe_set_compound(settings, "sponsorlogos", "backend", "SPONSORLOGOS_BACKEND")
     maybe_set_compound(settings, "origin_cache", "backend", "ORIGIN_CACHE")
     maybe_set_compound(settings, "mail", "backend", "MAIL_BACKEND")
     maybe_set_compound(settings, "metrics", "backend", "METRICS_BACKEND")
     maybe_set_compound(settings, "breached_passwords", "backend", "BREACHED_PASSWORDS")
     maybe_set_compound(settings, "malware_check", "backend", "MALWARE_CHECK_BACKEND")
+
+    # Pythondotorg integration settings
+    maybe_set(settings, "pythondotorg.host", "PYTHONDOTORG_HOST", default="python.org")
+    maybe_set(settings, "pythondotorg.api_token", "PYTHONDOTORG_API_TOKEN")
+
+    # Configure our ratelimiters
+    maybe_set(
+        settings,
+        "warehouse.account.user_login_ratelimit_string",
+        "USER_LOGIN_RATELIMIT_STRING",
+        default="10 per 5 minutes",
+    )
+    maybe_set(
+        settings,
+        "warehouse.account.ip_login_ratelimit_string",
+        "IP_LOGIN_RATELIMIT_STRING",
+        default="10 per 5 minutes",
+    )
+    maybe_set(
+        settings,
+        "warehouse.account.global_login_ratelimit_string",
+        "GLOBAL_LOGIN_RATELIMIT_STRING",
+        default="1000 per 5 minutes",
+    )
+    maybe_set(
+        settings,
+        "warehouse.account.email_add_ratelimit_string",
+        "EMAIL_ADD_RATELIMIT_STRING",
+        default="2 per day",
+    )
+    maybe_set(
+        settings,
+        "warehouse.account.password_reset_ratelimit_string",
+        "PASSWORD_RESET_RATELIMIT_STRING",
+        default="5 per day",
+    )
+    maybe_set(
+        settings,
+        "warehouse.manage.oidc.user_registration_ratelimit_string",
+        "USER_OIDC_REGISTRATION_RATELIMIT_STRING",
+        default="20 per day",
+    )
+    maybe_set(
+        settings,
+        "warehouse.manage.oidc.ip_registration_ratelimit_string",
+        "IP_OIDC_REGISTRATION_RATELIMIT_STRING",
+        default="20 per day",
+    )
+
+    # 2FA feature flags
+    maybe_set(
+        settings,
+        "warehouse.two_factor_requirement.enabled",
+        "TWOFACTORREQUIREMENT_ENABLED",
+        coercer=distutils.util.strtobool,
+        default=False,
+    )
+    maybe_set(
+        settings,
+        "warehouse.two_factor_mandate.available",
+        "TWOFACTORMANDATE_AVAILABLE",
+        coercer=distutils.util.strtobool,
+        default=False,
+    )
+    maybe_set(
+        settings,
+        "warehouse.two_factor_mandate.enabled",
+        "TWOFACTORMANDATE_ENABLED",
+        coercer=distutils.util.strtobool,
+        default=False,
+    )
+
+    # OIDC feature flags
+    maybe_set(
+        settings,
+        "warehouse.oidc.enabled",
+        "OIDC_ENABLED",
+        coercer=distutils.util.strtobool,
+        default=False,
+    )
 
     # Add the settings we use when the environment is set to development.
     if settings["warehouse.env"] == Environment.development:
@@ -309,6 +410,7 @@ def configure(settings=None):
     filters.setdefault("format_package_type", "warehouse.filters:format_package_type")
     filters.setdefault("parse_version", "warehouse.filters:parse_version")
     filters.setdefault("localize_datetime", "warehouse.filters:localize_datetime")
+    filters.setdefault("is_recent", "warehouse.filters:is_recent")
 
     # We also want to register some global functions for Jinja
     jglobals = config.get_settings().setdefault("jinja2.globals", {})
@@ -318,6 +420,7 @@ def configure(settings=None):
     jglobals.setdefault("now", "warehouse.utils:now")
 
     # And some enums to reuse in the templates
+    jglobals.setdefault("AdminFlagValue", "warehouse.admin.flags:AdminFlagValue")
     jglobals.setdefault(
         "RoleInvitationStatus", "warehouse.packaging.models:RoleInvitationStatus"
     )
@@ -363,8 +466,8 @@ def configure(settings=None):
     # Register support for our legacy action URLs
     config.include(".legacy.action_routing")
 
-    # Register support for our domain predicates
-    config.include(".domain")
+    # Register support for our custom predicates
+    config.include(".predicates")
 
     # Register support for template views.
     config.add_directive("add_template_view", template_view, action_wrap=False)
@@ -407,11 +510,17 @@ def configure(settings=None):
     # Register support for Macaroon based authentication
     config.include(".macaroons")
 
+    # Register support for OIDC provider based authentication
+    config.include(".oidc")
+
     # Register support for malware checks
     config.include(".malware")
 
     # Register logged-in views
     config.include(".manage")
+
+    # Register our organization support.
+    config.include(".organizations")
 
     # Allow the packaging app to register any services it has.
     config.include(".packaging")
@@ -421,6 +530,12 @@ def configure(settings=None):
 
     # Register all our URL routes for Warehouse.
     config.include(".routes")
+
+    # Allow the sponsors app to list sponsors
+    config.include(".sponsors")
+
+    # Allow the banners app to list banners
+    config.include(".banners")
 
     # Include our admin application
     config.include(".admin")
@@ -479,10 +594,6 @@ def configure(settings=None):
     # Protect against cache poisoning via the X-Vhm-Root headers.
     config.add_wsgi_middleware(VhmRootRemover)
 
-    # Fix our host header when getting sent upload.pypi.io as a HOST.
-    # TODO: Remove this, this is at the wrong layer.
-    config.add_wsgi_middleware(HostRewrite)
-
     # We want Sentry to be the last things we add here so that it's the outer
     # most WSGI middleware.
     config.include(".sentry")
@@ -496,13 +607,13 @@ def configure(settings=None):
     config.add_settings({"http": {"verify": "/etc/ssl/certs/"}})
     config.include(".http")
 
-    # Add our theme if one was configured
-    if config.get_settings().get("warehouse.theme"):
-        config.include(config.get_settings()["warehouse.theme"])
-
     # Scan everything for configuration
     config.scan(
-        ignore=["warehouse.migrations.env", "warehouse.celery", "warehouse.wsgi"]
+        categories=(
+            "pyramid",
+            "warehouse",
+        ),
+        ignore=["warehouse.migrations.env", "warehouse.celery", "warehouse.wsgi"],
     )
 
     # Sanity check our request and responses.

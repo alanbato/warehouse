@@ -13,18 +13,27 @@
 import base64
 import io
 
+from datetime import datetime, timezone
+
 import pyqrcode
 
 from paginate_sqlalchemy import SqlalchemyOrmPage as SQLAlchemyORMPage
-from pyramid.httpexceptions import HTTPBadRequest, HTTPNotFound, HTTPSeeOther
+from pyramid.httpexceptions import (
+    HTTPBadRequest,
+    HTTPNotFound,
+    HTTPSeeOther,
+    HTTPTooManyRequests,
+)
 from pyramid.response import Response
 from pyramid.view import view_config, view_defaults
 from sqlalchemy import func
 from sqlalchemy.orm import Load, joinedload
 from sqlalchemy.orm.exc import NoResultFound
+from webauthn.helpers import bytes_to_base64url
 
 import warehouse.utils.otp as otp
 
+from warehouse.accounts.forms import RecoveryCodeAuthenticationForm
 from warehouse.accounts.interfaces import (
     IPasswordBreachedService,
     ITokenService,
@@ -36,12 +45,17 @@ from warehouse.accounts.views import logout
 from warehouse.admin.flags import AdminFlagValue
 from warehouse.email import (
     send_account_deletion_email,
+    send_admin_new_organization_requested_email,
     send_collaborator_removed_email,
     send_collaborator_role_changed_email,
     send_email_verification_email,
+    send_new_organization_requested_email,
+    send_oidc_provider_added_email,
+    send_oidc_provider_removed_email,
     send_password_change_email,
     send_primary_email_change_email,
     send_project_role_verification_email,
+    send_recovery_codes_generated_email,
     send_removed_as_collaborator_email,
     send_removed_project_email,
     send_removed_project_release_email,
@@ -60,6 +74,7 @@ from warehouse.manage.forms import (
     ChangeRoleForm,
     ConfirmPasswordForm,
     CreateMacaroonForm,
+    CreateOrganizationForm,
     CreateRoleForm,
     DeleteMacaroonForm,
     DeleteTOTPForm,
@@ -67,28 +82,41 @@ from warehouse.manage.forms import (
     ProvisionTOTPForm,
     ProvisionWebAuthnForm,
     SaveAccountForm,
+    Toggle2FARequirementForm,
 )
+from warehouse.metrics.interfaces import IMetricsService
+from warehouse.oidc.forms import DeleteProviderForm, GitHubProviderForm
+from warehouse.oidc.interfaces import TooManyOIDCRegistrations
+from warehouse.oidc.models import GitHubProvider, OIDCProvider
+from warehouse.organizations.interfaces import IOrganizationService
 from warehouse.packaging.models import (
     File,
     JournalEntry,
     Project,
-    ProjectEvent,
     Release,
     Role,
     RoleInvitation,
     RoleInvitationStatus,
 )
+from warehouse.rate_limiting import IRateLimiter
 from warehouse.utils.http import is_safe_url
 from warehouse.utils.paginate import paginate_url_factory
 from warehouse.utils.project import confirm_project, destroy_docs, remove_project
 
 
 def user_projects(request):
-    """ Return all the projects for which the user is a sole owner """
+    """Return all the projects for which the user is a sole owner"""
     projects_owned = (
         request.db.query(Project.id)
         .join(Role.project)
         .filter(Role.role_name == "Owner", Role.user == request.user)
+        .subquery()
+    )
+
+    projects_collaborator = (
+        request.db.query(Project.id)
+        .join(Role.project)
+        .filter(Role.user == request.user)
         .subquery()
     )
 
@@ -111,7 +139,25 @@ def user_projects(request):
         "projects_sole_owned": (
             request.db.query(Project).join(with_sole_owner).order_by(Project.name).all()
         ),
+        "projects_requiring_2fa": (
+            request.db.query(Project)
+            .join(projects_collaborator, Project.id == projects_collaborator.c.id)
+            .filter(Project.two_factor_required)
+            .order_by(Project.name)
+            .all()
+        ),
     }
+
+
+def project_owners(request, project):
+    """Return all users who are owners of the project."""
+    owner_roles = (
+        request.db.query(User.id)
+        .join(Role.user)
+        .filter(Role.role_name == "Owner", Role.project == project)
+        .subquery()
+    )
+    return request.db.query(User).join(owner_roles, User.id == owner_roles.c.id).all()
 
 
 @view_defaults(
@@ -149,7 +195,9 @@ class ManageAccountViews:
                 user_service=self.user_service, user_id=self.request.user.id
             ),
             "change_password_form": ChangePasswordForm(
-                user_service=self.user_service, breach_service=self.breach_service
+                request=self.request,
+                user_service=self.user_service,
+                breach_service=self.breach_service,
             ),
             "active_projects": self.active_projects,
         }
@@ -189,13 +237,10 @@ class ManageAccountViews:
         )
 
         if form.validate():
-            email = self.user_service.add_email(
-                self.request.user.id, form.email.data, self.request.remote_addr
-            )
+            email = self.user_service.add_email(self.request.user.id, form.email.data)
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:email:add",
-                ip_address=self.request.remote_addr,
                 additional={"email": email.email},
             )
 
@@ -239,7 +284,6 @@ class ManageAccountViews:
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:email:remove",
-                ip_address=self.request.remote_addr,
                 additional={"email": email.email},
             )
             self.request.session.flash(
@@ -274,7 +318,6 @@ class ManageAccountViews:
         self.user_service.record_event(
             self.request.user.id,
             tag="account:email:primary:change",
-            ip_address=self.request.remote_addr,
             additional={
                 "old_primary": previous_primary_email.email
                 if previous_primary_email
@@ -328,6 +371,7 @@ class ManageAccountViews:
     def change_password(self):
         form = ChangePasswordForm(
             **self.request.POST,
+            request=self.request,
             username=self.request.user.username,
             full_name=self.request.user.name,
             email=self.request.user.email,
@@ -343,9 +387,13 @@ class ManageAccountViews:
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:password:change",
-                ip_address=self.request.remote_addr,
             )
             send_password_change_email(self.request, self.request.user)
+            self.request.db.flush()  # Ensure changes are persisted to DB
+            self.request.db.refresh(self.request.user)  # Pickup new password_date
+            self.request.session.record_password_timestamp(
+                self.user_service.get_password_timestamp(self.request.user.id)
+            )
             self.request.session.flash("Password updated", queue="success")
 
         return {**self.default_response, "change_password_form": form}
@@ -360,6 +408,7 @@ class ManageAccountViews:
             return self.default_response
 
         form = ConfirmPasswordForm(
+            request=self.request,
             password=confirm_password,
             username=self.request.user.username,
             user_service=self.user_service,
@@ -402,6 +451,20 @@ class ManageAccountViews:
         return logout(self.request)
 
 
+@view_config(
+    route_name="manage.account.two-factor",
+    renderer="manage/account/two-factor.html",
+    uses_session=True,
+    require_csrf=True,
+    require_methods=False,
+    permission="manage:user",
+    has_translations=True,
+    require_reauth=True,
+)
+def manage_two_factor(request):
+    return {}
+
+
 @view_defaults(
     route_name="manage.account.totp-provision",
     renderer="manage/account/totp-provision.html",
@@ -436,7 +499,7 @@ class ProvisionTOTPViews:
             self.request.session.flash(
                 "Verify your email to modify two factor authentication", queue="error"
             )
-            return Response(status=403)
+            return HTTPSeeOther(self.request.route_path("manage.account"))
 
         totp_secret = self.user_service.get_totp_secret(self.request.user.id)
         if totp_secret:
@@ -450,11 +513,16 @@ class ProvisionTOTPViews:
 
     @view_config(request_method="GET")
     def totp_provision(self):
+        if not self.request.user.has_burned_recovery_codes:
+            return HTTPSeeOther(
+                self.request.route_path("manage.account.recovery-codes.burn")
+            )
+
         if not self.request.user.has_primary_verified_email:
             self.request.session.flash(
                 "Verify your email to modify two factor authentication", queue="error"
             )
-            return Response(status=403)
+            return HTTPSeeOther(self.request.route_path("manage.account"))
 
         totp_secret = self.user_service.get_totp_secret(self.request.user.id)
         if totp_secret:
@@ -473,7 +541,7 @@ class ProvisionTOTPViews:
             self.request.session.flash(
                 "Verify your email to modify two factor authentication", queue="error"
             )
-            return Response(status=403)
+            return HTTPSeeOther(self.request.route_path("manage.account"))
 
         totp_secret = self.user_service.get_totp_secret(self.request.user.id)
         if totp_secret:
@@ -496,7 +564,6 @@ class ProvisionTOTPViews:
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:two_factor:method_added",
-                ip_address=self.request.remote_addr,
                 additional={"method": "totp"},
             )
             self.request.session.flash(
@@ -514,7 +581,7 @@ class ProvisionTOTPViews:
             self.request.session.flash(
                 "Verify your email to modify two factor authentication", queue="error"
             )
-            return Response(status=403)
+            return HTTPSeeOther(self.request.route_path("manage.account"))
 
         totp_secret = self.user_service.get_totp_secret(self.request.user.id)
         if not totp_secret:
@@ -524,6 +591,7 @@ class ProvisionTOTPViews:
             return HTTPSeeOther(self.request.route_path("manage.account"))
 
         form = DeleteTOTPForm(
+            request=self.request,
             password=self.request.POST["confirm_password"],
             username=self.request.user.username,
             user_service=self.user_service,
@@ -534,7 +602,6 @@ class ProvisionTOTPViews:
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:two_factor:method_removed",
-                ip_address=self.request.remote_addr,
                 additional={"method": "totp"},
             )
             self.request.session.flash(
@@ -570,6 +637,10 @@ class ProvisionWebAuthnViews:
         renderer="manage/account/webauthn-provision.html",
     )
     def webauthn_provision(self):
+        if not self.request.user.has_burned_recovery_codes:
+            return HTTPSeeOther(
+                self.request.route_path("manage.account.recovery-codes.burn")
+            )
         return {}
 
     @view_config(
@@ -607,14 +678,17 @@ class ProvisionWebAuthnViews:
             self.user_service.add_webauthn(
                 self.request.user.id,
                 label=form.label.data,
-                credential_id=form.validated_credential.credential_id.decode(),
-                public_key=form.validated_credential.public_key.decode(),
+                credential_id=bytes_to_base64url(
+                    form.validated_credential.credential_id
+                ),
+                public_key=bytes_to_base64url(
+                    form.validated_credential.credential_public_key
+                ),
                 sign_count=form.validated_credential.sign_count,
             )
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:two_factor:method_added",
-                ip_address=self.request.remote_addr,
                 additional={"method": "webauthn", "label": form.label.data},
             )
             self.request.session.flash(
@@ -655,7 +729,6 @@ class ProvisionWebAuthnViews:
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:two_factor:method_removed",
-                ip_address=self.request.remote_addr,
                 additional={"method": "webauthn", "label": form.label.data},
             )
             self.request.session.flash("Security device removed", queue="success")
@@ -685,18 +758,9 @@ class ProvisionRecoveryCodesViews:
         request_method="GET",
         route_name="manage.account.recovery-codes.generate",
         renderer="manage/account/recovery_codes-provision.html",
+        require_reauth=10,  # 10 seconds
     )
     def recovery_codes_generate(self):
-        if not self.user_service.has_two_factor(self.request.user.id):
-            self.request.session.flash(
-                self.request._(
-                    "You must provision a two factor method before recovery "
-                    "codes can be generated"
-                ),
-                queue="error",
-            )
-            return HTTPSeeOther(self.request.route_path("manage.account"))
-
         if self.user_service.has_recovery_codes(self.request.user.id):
             return {
                 "recovery_codes": None,
@@ -706,55 +770,60 @@ class ProvisionRecoveryCodesViews:
                 ),
             }
 
+        recovery_codes = self.user_service.generate_recovery_codes(self.request.user.id)
+        send_recovery_codes_generated_email(self.request, self.request.user)
         self.user_service.record_event(
             self.request.user.id,
             tag="account:recovery_codes:generated",
-            ip_address=self.request.remote_addr,
         )
-        return {
-            "recovery_codes": self.user_service.generate_recovery_codes(
-                self.request.user.id
-            )
-        }
+
+        return {"recovery_codes": recovery_codes}
 
     @view_config(
-        request_method="POST",
+        request_method="GET",
         route_name="manage.account.recovery-codes.regenerate",
         renderer="manage/account/recovery_codes-provision.html",
+        require_reauth=10,  # 10 seconds
     )
     def recovery_codes_regenerate(self):
-        if not self.user_service.has_two_factor(self.request.user.id):
-            self.request.session.flash(
-                self.request._(
-                    "You must provision a two factor method before recovery "
-                    "codes can be generated"
-                ),
-                queue="error",
-            )
-            return HTTPSeeOther(self.request.route_path("manage.account"))
+        recovery_codes = self.user_service.generate_recovery_codes(self.request.user.id)
+        send_recovery_codes_generated_email(self.request, self.request.user)
+        self.user_service.record_event(
+            self.request.user.id,
+            tag="account:recovery_codes:regenerated",
+        )
 
-        form = ConfirmPasswordForm(
-            password=self.request.POST["confirm_password"],
-            username=self.request.user.username,
+        return {"recovery_codes": recovery_codes}
+
+    @view_config(
+        route_name="manage.account.recovery-codes.burn",
+        renderer="manage/account/recovery_codes-burn.html",
+    )
+    def recovery_codes_burn(self, _form_class=RecoveryCodeAuthenticationForm):
+        user = self.user_service.get_user(self.request.user.id)
+
+        if not user.has_recovery_codes:
+            return HTTPSeeOther(self.request.route_path("manage.account"))
+        if user.has_burned_recovery_codes:
+            return HTTPSeeOther(self.request.route_path("manage.account.two-factor"))
+
+        form = _form_class(
+            self.request.POST,
+            request=self.request,
+            user_id=user.id,
             user_service=self.user_service,
         )
 
-        if form.validate():
-            self.user_service.record_event(
-                self.request.user.id,
-                tag="account:recovery_codes:regenerated",
-                ip_address=self.request.remote_addr,
+        if self.request.method == "POST" and form.validate():
+            self.request.session.flash(
+                self.request._(
+                    "Recovery code accepted. The supplied code cannot be used again."
+                ),
+                queue="success",
             )
-            return {
-                "recovery_codes": self.user_service.generate_recovery_codes(
-                    self.request.user.id
-                )
-            }
+            return HTTPSeeOther(self.request.route_path("manage.account.two-factor"))
 
-        self.request.session.flash(
-            self.request._("Invalid credentials. Try again"), queue="error"
-        )
-        return HTTPSeeOther(self.request.route_path("manage.account"))
+        return {"form": form}
 
 
 @view_defaults(
@@ -787,6 +856,7 @@ class ProvisionMacaroonViews:
                 project_names=self.project_names,
             ),
             "delete_macaroon_form": DeleteMacaroonForm(
+                request=self.request,
                 username=self.request.user.username,
                 user_service=self.user_service,
                 macaroon_service=self.macaroon_service,
@@ -814,7 +884,7 @@ class ProvisionMacaroonViews:
 
         response = {**self.default_response}
         if form.validate():
-            macaroon_caveats = {"permissions": form.validated_scope, "version": 1}
+            macaroon_caveats = [{"permissions": form.validated_scope, "version": 1}]
             serialized_macaroon, macaroon = self.macaroon_service.create_macaroon(
                 location=self.request.domain,
                 user_id=self.request.user.id,
@@ -824,7 +894,6 @@ class ProvisionMacaroonViews:
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:api_token:added",
-                ip_address=self.request.remote_addr,
                 additional={
                     "description": form.description.data,
                     "caveats": macaroon_caveats,
@@ -861,6 +930,7 @@ class ProvisionMacaroonViews:
     )
     def delete_macaroon(self):
         form = DeleteMacaroonForm(
+            request=self.request,
             password=self.request.POST["confirm_password"],
             macaroon_id=self.request.POST["macaroon_id"],
             macaroon_service=self.macaroon_service,
@@ -874,15 +944,14 @@ class ProvisionMacaroonViews:
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:api_token:removed",
-                ip_address=self.request.remote_addr,
                 additional={"macaroon_id": form.macaroon_id.data},
             )
-            if "projects" in macaroon.caveats["permissions"]:
+            if "projects" in macaroon.permissions_caveat:
                 projects = [
                     project
                     for project in self.request.user.projects
                     if project.normalized_name
-                    in macaroon.caveats["permissions"]["projects"]
+                    in macaroon.permissions_caveat["projects"]
                 ]
                 for project in projects:
                     project.record_event(
@@ -905,6 +974,113 @@ class ProvisionMacaroonViews:
         return HTTPSeeOther(redirect_to)
 
 
+@view_defaults(
+    route_name="manage.organizations",
+    renderer="manage/organizations.html",
+    uses_session=True,
+    require_csrf=True,
+    require_methods=False,
+    permission="manage:user",
+    has_translations=True,
+)
+class ManageOrganizationsViews:
+    def __init__(self, request):
+        self.request = request
+        self.user_service = request.find_service(IUserService, context=None)
+        self.organization_service = request.find_service(
+            IOrganizationService, context=None
+        )
+
+    @property
+    def default_response(self):
+        return {
+            "create_organization_form": CreateOrganizationForm(
+                organization_service=self.organization_service,
+            ),
+        }
+
+    @view_config(request_method="GET")
+    def manage_organizations(self):
+        if self.request.flags.enabled(AdminFlagValue.DISABLE_ORGANIZATIONS):
+            raise HTTPNotFound
+
+        return self.default_response
+
+    @view_config(request_method="POST", request_param=CreateOrganizationForm.__params__)
+    def create_organization(self):
+        if self.request.flags.enabled(AdminFlagValue.DISABLE_ORGANIZATIONS):
+            raise HTTPNotFound
+
+        form = CreateOrganizationForm(
+            self.request.POST,
+            organization_service=self.organization_service,
+        )
+
+        if form.validate():
+            data = form.data
+            organization = self.organization_service.add_organization(**data)
+            self.organization_service.record_event(
+                organization.id,
+                tag="organization:create",
+                additional={"created_by_user_id": str(self.request.user.id)},
+            )
+            self.organization_service.add_catalog_entry(
+                organization.name, organization.id
+            )
+            self.organization_service.record_event(
+                organization.id,
+                tag="organization:catalog_entry:add",
+                additional={"submitted_by_user_id": str(self.request.user.id)},
+            )
+            self.organization_service.add_organization_role(
+                "Owner", self.request.user.id, organization.id
+            )
+            self.organization_service.record_event(
+                organization.id,
+                tag="organization:organization_role:invite",
+                additional={
+                    "submitted_by_user_id": str(self.request.user.id),
+                    "role_name": "Owner",
+                    "target_user_id": str(self.request.user.id),
+                },
+            )
+            self.organization_service.record_event(
+                organization.id,
+                tag="organization:organization_role:accepted",
+                additional={
+                    "submitted_by_user_id": str(self.request.user.id),
+                    "role_name": "Owner",
+                    "target_user_id": str(self.request.user.id),
+                },
+            )
+            self.user_service.record_event(
+                self.request.user.id,
+                tag="account:organization_role:accepted",
+                additional={
+                    "submitted_by_user_id": str(self.request.user.id),
+                    "organization_name": organization.name,
+                    "role_name": "Owner",
+                },
+            )
+            send_admin_new_organization_requested_email(
+                self.request,
+                self.user_service.get_admins(),
+                organization_name=organization.name,
+                initiator_username=self.request.user.username,
+                organization_id=organization.id,
+            )
+            send_new_organization_requested_email(
+                self.request, self.request.user, organization_name=organization.name
+            )
+            self.request.session.flash(
+                "Request for new organization submitted", queue="success"
+            )
+        else:
+            return {"create_organization_form": form}
+
+        return self.default_response
+
+
 @view_config(
     route_name="manage.projects",
     renderer="manage/projects.html",
@@ -925,6 +1101,10 @@ def manage_projects(request):
     projects_sole_owned = set(
         project.name for project in all_user_projects["projects_sole_owned"]
     )
+    projects_requiring_2fa = set(
+        project.name for project in all_user_projects["projects_requiring_2fa"]
+    )
+
     project_invites = (
         request.db.query(RoleInvitation)
         .filter(RoleInvitation.invite_status == RoleInvitationStatus.Pending)
@@ -938,11 +1118,12 @@ def manage_projects(request):
         "projects": sorted(request.user.projects, key=_key, reverse=True),
         "projects_owned": projects_owned,
         "projects_sole_owned": projects_sole_owned,
+        "projects_requiring_2fa": projects_requiring_2fa,
         "project_invites": project_invites,
     }
 
 
-@view_config(
+@view_defaults(
     route_name="manage.project.settings",
     context=Project,
     renderer="manage/settings.html",
@@ -950,13 +1131,313 @@ def manage_projects(request):
     permission="manage:project",
     has_translations=True,
     require_reauth=True,
+    require_methods=False,
 )
-def manage_project_settings(project, request):
-    return {
-        "project": project,
-        "MAX_FILESIZE": MAX_FILESIZE,
-        "MAX_PROJECT_SIZE": MAX_PROJECT_SIZE,
-    }
+class ManageProjectSettingsViews:
+    def __init__(self, project, request):
+        self.project = project
+        self.request = request
+        self.toggle_2fa_requirement_form_class = Toggle2FARequirementForm
+
+    @view_config(request_method="GET")
+    def manage_project_settings(self):
+        return {
+            "project": self.project,
+            "MAX_FILESIZE": MAX_FILESIZE,
+            "MAX_PROJECT_SIZE": MAX_PROJECT_SIZE,
+            "toggle_2fa_form": self.toggle_2fa_requirement_form_class(),
+        }
+
+    @view_config(
+        request_method="POST",
+        request_param=Toggle2FARequirementForm.__params__,
+        require_reauth=True,
+    )
+    def toggle_2fa_requirement(self):
+        if not self.request.registry.settings[
+            "warehouse.two_factor_requirement.enabled"
+        ]:
+            raise HTTPNotFound
+
+        if self.project.pypi_mandates_2fa:
+            self.request.session.flash(
+                "2FA requirement cannot be disabled for critical projects",
+                queue="error",
+            )
+        elif self.project.owners_require_2fa:
+            self.project.owners_require_2fa = False
+            self.project.record_event(
+                tag="project:owners_require_2fa:disabled",
+                ip_address=self.request.remote_addr,
+                additional={"modified_by": self.request.user.username},
+            )
+            self.request.session.flash(
+                f"2FA requirement disabled for { self.project.name }",
+                queue="success",
+            )
+        else:
+            self.project.owners_require_2fa = True
+            self.project.record_event(
+                tag="project:owners_require_2fa:enabled",
+                ip_address=self.request.remote_addr,
+                additional={"modified_by": self.request.user.username},
+            )
+            self.request.session.flash(
+                f"2FA requirement enabled for { self.project.name }",
+                queue="success",
+            )
+
+        return HTTPSeeOther(
+            self.request.route_path(
+                "manage.project.settings", project_name=self.project.name
+            )
+        )
+
+
+@view_defaults(
+    context=Project,
+    route_name="manage.project.settings.publishing",
+    renderer="manage/publishing.html",
+    uses_session=True,
+    require_csrf=True,
+    require_methods=False,
+    permission="manage:project",
+    has_translations=True,
+    require_reauth=True,
+    http_cache=0,
+)
+class ManageOIDCProviderViews:
+    def __init__(self, project, request):
+        self.request = request
+        self.project = project
+        self.oidc_enabled = self.request.registry.settings["warehouse.oidc.enabled"]
+        self.metrics = self.request.find_service(IMetricsService, context=None)
+
+    @property
+    def _ratelimiters(self):
+        return {
+            "user.oidc": self.request.find_service(
+                IRateLimiter, name="user_oidc.provider.register"
+            ),
+            "ip.oidc": self.request.find_service(
+                IRateLimiter, name="ip_oidc.provider.register"
+            ),
+        }
+
+    def _hit_ratelimits(self):
+        self._ratelimiters["user.oidc"].hit(self.request.user.id)
+        self._ratelimiters["ip.oidc"].hit(self.request.remote_addr)
+
+    def _check_ratelimits(self):
+        if not self._ratelimiters["user.oidc"].test(self.request.user.id):
+            raise TooManyOIDCRegistrations(
+                resets_in=self._ratelimiters["user.oidc"].resets_in(
+                    self.request.user.id
+                )
+            )
+
+        if not self._ratelimiters["ip.oidc"].test(self.request.remote_addr):
+            raise TooManyOIDCRegistrations(
+                resets_in=self._ratelimiters["ip.oidc"].resets_in(
+                    self.request.remote_addr
+                )
+            )
+
+    @property
+    def github_provider_form(self):
+        return GitHubProviderForm(
+            self.request.POST,
+            api_token=self.request.registry.settings.get("github.token"),
+        )
+
+    @property
+    def default_response(self):
+        return {
+            "oidc_enabled": self.oidc_enabled,
+            "project": self.project,
+            "github_provider_form": self.github_provider_form,
+        }
+
+    @view_config(request_method="GET")
+    def manage_project_oidc_providers(self):
+        if not self.oidc_enabled:
+            raise HTTPNotFound
+
+        if self.request.flags.enabled(AdminFlagValue.DISALLOW_OIDC):
+            self.request.session.flash(
+                (
+                    "OpenID Connect is temporarily disabled. "
+                    "See https://pypi.org/help#admin-intervention for details."
+                ),
+                queue="error",
+            )
+
+        return self.default_response
+
+    @view_config(request_method="POST", request_param=GitHubProviderForm.__params__)
+    def add_github_oidc_provider(self):
+        if not self.oidc_enabled:
+            raise HTTPNotFound
+
+        self.metrics.increment(
+            "warehouse.oidc.add_provider.attempt", tags=["provider:GitHub"]
+        )
+
+        if self.request.flags.enabled(AdminFlagValue.DISALLOW_OIDC):
+            self.request.session.flash(
+                (
+                    "OpenID Connect is temporarily disabled. "
+                    "See https://pypi.org/help#admin-intervention for details."
+                ),
+                queue="error",
+            )
+            return self.default_response
+
+        try:
+            self._check_ratelimits()
+        except TooManyOIDCRegistrations as exc:
+            self.metrics.increment(
+                "warehouse.oidc.add_provider.ratelimited", tags=["provider:GitHub"]
+            )
+            return HTTPTooManyRequests(
+                self.request._(
+                    "There have been too many attempted OpenID Connect registrations. "
+                    "Try again later."
+                ),
+                retry_after=exc.resets_in.total_seconds(),
+            )
+
+        self._hit_ratelimits()
+
+        response = self.default_response
+        form = response["github_provider_form"]
+
+        if form.validate():
+            # GitHub OIDC providers are unique on the tuple of
+            # (repository_name, repository_owner, workflow_filename), so we check for
+            # an already registered one before creating.
+            provider = (
+                self.request.db.query(GitHubProvider)
+                .filter(
+                    GitHubProvider.repository_name == form.repository.data,
+                    GitHubProvider.repository_owner == form.normalized_owner,
+                    GitHubProvider.workflow_filename == form.workflow_filename.data,
+                )
+                .one_or_none()
+            )
+            if provider is None:
+                provider = GitHubProvider(
+                    repository_name=form.repository.data,
+                    repository_owner=form.normalized_owner,
+                    repository_owner_id=form.owner_id,
+                    workflow_filename=form.workflow_filename.data,
+                )
+
+                self.request.db.add(provider)
+
+            # Each project has a unique set of OIDC providers; the same
+            # provider can't be registered to the project more than once.
+            if provider in self.project.oidc_providers:
+                self.request.session.flash(
+                    f"{provider} is already registered with {self.project.name}",
+                    queue="error",
+                )
+                return response
+
+            for user in self.project.users:
+                send_oidc_provider_added_email(
+                    self.request,
+                    user,
+                    project_name=self.project.name,
+                    provider=provider,
+                )
+
+            self.project.oidc_providers.append(provider)
+
+            self.project.record_event(
+                tag="project:oidc:provider-added",
+                ip_address=self.request.remote_addr,
+                additional={
+                    "provider": provider.provider_name,
+                    "id": str(provider.id),
+                    "specifier": str(provider),
+                },
+            )
+
+            self.request.session.flash(
+                f"Added {provider} to {self.project.name}",
+                queue="success",
+            )
+
+            self.metrics.increment(
+                "warehouse.oidc.add_provider.ok", tags=["provider:GitHub"]
+            )
+
+        return response
+
+    @view_config(request_method="POST", request_param=DeleteProviderForm.__params__)
+    def delete_oidc_provider(self):
+        if not self.oidc_enabled:
+            raise HTTPNotFound
+
+        self.metrics.increment("warehouse.oidc.delete_provider.attempt")
+
+        if self.request.flags.enabled(AdminFlagValue.DISALLOW_OIDC):
+            self.request.session.flash(
+                (
+                    "OpenID Connect is temporarily disabled. "
+                    "See https://pypi.org/help#admin-intervention for details."
+                ),
+                queue="error",
+            )
+            return self.default_response
+
+        form = DeleteProviderForm(self.request.POST)
+
+        if form.validate():
+            provider = self.request.db.query(OIDCProvider).get(form.provider_id.data)
+
+            # provider will be `None` here if someone manually futzes with the form.
+            if provider is None or provider not in self.project.oidc_providers:
+                self.request.session.flash(
+                    "Invalid publisher for project",
+                    queue="error",
+                )
+                return self.default_response
+
+            for user in self.project.users:
+                send_oidc_provider_removed_email(
+                    self.request,
+                    user,
+                    project_name=self.project.name,
+                    provider=provider,
+                )
+
+            # NOTE: We remove the provider from the project, but we don't actually
+            # delete the provider model itself (since it might be associated
+            # with other projects).
+            self.project.oidc_providers.remove(provider)
+
+            self.project.record_event(
+                tag="project:oidc:provider-removed",
+                ip_address=self.request.remote_addr,
+                additional={
+                    "provider": provider.provider_name,
+                    "id": str(provider.id),
+                    "specifier": str(provider),
+                },
+            )
+
+            self.request.session.flash(
+                f"Removed {provider} from {self.project.name}", queue="success"
+            )
+
+            self.metrics.increment(
+                "warehouse.oidc.delete_provider.ok",
+                tags=[f"provider:{provider.provider_name}"],
+            )
+
+        return self.default_response
 
 
 def get_user_role_in_project(project, user, request):
@@ -1097,6 +1578,81 @@ class ManageProjectRelease:
             "release": self.release,
             "files": self.release.files.all(),
         }
+
+    @view_config(
+        request_method="POST",
+        request_param=["confirm_publish_version"],
+        require_reauth=True,
+    )
+    def publish_project_release(self):
+        version = self.request.POST.get("confirm_publish_version")
+
+        if not self.release.is_draft:
+            self.request.session.flash(
+                "This release is already published", queue="error"
+            )
+            return HTTPSeeOther(
+                self.request.route_path(
+                    "manage.project.release",
+                    project_name=self.release.project.name,
+                    version=self.release.version_or_draft,
+                )
+            )
+
+        if not version:
+            self.request.session.flash("Confirm the request", queue="error")
+            return HTTPSeeOther(
+                self.request.route_path(
+                    "manage.project.release",
+                    project_name=self.release.project.name,
+                    version=self.release.version_or_draft,
+                )
+            )
+
+        if version != self.release.version:
+            self.request.session.flash(
+                "Could not publish release - "
+                + f"{version!r} is not the same as {self.release.version!r}",
+                queue="error",
+            )
+            return HTTPSeeOther(
+                self.request.route_path(
+                    "manage.project.release",
+                    project_name=self.release.project.name,
+                    version=self.release.version_or_draft,
+                )
+            )
+
+        self.request.db.add(
+            JournalEntry(
+                name=self.release.project.name,
+                action="publish release",
+                version=self.release.version,
+                submitted_by=self.request.user,
+                submitted_from=self.request.remote_addr,
+            )
+        )
+
+        self.release.project.record_event(
+            tag="project:release:publish",
+            ip_address=self.request.remote_addr,
+            additional={
+                "published_by": self.request.user.username,
+                "canonical_version": self.release.canonical_version,
+            },
+        )
+
+        self.release.published = datetime.now(tz=timezone.utc)
+
+        self.request.session.flash(
+            f"Published release {self.release.version!r}", queue="success"
+        )
+
+        return HTTPSeeOther(
+            self.request.route_path(
+                "manage.project.releases", project_name=self.release.project.name
+            )
+        )
 
     @view_config(
         request_method="POST",
@@ -1454,7 +2010,7 @@ class ManageProjectRelease:
             self.request.route_path(
                 "manage.project.release",
                 project_name=self.release.project.name,
-                version=self.release.version,
+                version=self.release.version_or_draft,
             )
         )
 
@@ -1721,13 +2277,7 @@ def change_project_role(project, request, _form_class=ChangeRoleForm):
                     },
                 )
 
-                owner_roles = (
-                    request.db.query(Role)
-                    .filter(Role.project == project)
-                    .filter(Role.role_name == "Owner")
-                    .all()
-                )
-                owner_users = {owner.user for owner in owner_roles}
+                owner_users = set(project_owners(request, project))
                 # Don't send owner notification email to new user
                 # if they are now an owner
                 owner_users.discard(role.user)
@@ -1771,6 +2321,7 @@ def delete_project_role(project, request):
         role = (
             request.db.query(Role)
             .join(User)
+            .filter(Role.project == project)
             .filter(Role.id == request.POST["role_id"])
             .one()
         )
@@ -1797,13 +2348,7 @@ def delete_project_role(project, request):
                 },
             )
 
-            owner_roles = (
-                request.db.query(Role)
-                .filter(Role.project == project)
-                .filter(Role.role_name == "Owner")
-                .all()
-            )
-            owner_users = {owner.user for owner in owner_roles}
+            owner_users = set(project_owners(request, project))
             # Don't send owner notification email to new user
             # if they are now an owner
             owner_users.discard(role.user)
@@ -1843,10 +2388,10 @@ def manage_project_history(project, request):
         raise HTTPBadRequest("'page' must be an integer.")
 
     events_query = (
-        request.db.query(ProjectEvent)
-        .join(ProjectEvent.project)
-        .filter(ProjectEvent.project_id == project.id)
-        .order_by(ProjectEvent.time.desc())
+        request.db.query(Project.Event)
+        .join(Project.Event.source)
+        .filter(Project.Event.source_id == project.id)
+        .order_by(Project.Event.time.desc())
     )
 
     events = SQLAlchemyORMPage(
